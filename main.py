@@ -1,87 +1,125 @@
 import os
-import json
 import logging
-import asyncio
-
+import gspread
+from fastapi import FastAPI, Request, HTTPException
+from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+import pandas as pd
 
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+# --- Biến môi trường ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1001234567890"))  # Ví dụ: -100.... (bắt buộc đúng định dạng)
+GOOGLE_SHEET_JSON = os.environ.get("GOOGLE_SHEET_JSON")  # Chuỗi JSON (định dạng file key)
+SHEET_NAME = os.environ.get("SHEET_NAME", "KeyData")
+SHEET_TABS = os.environ.get("SHEET_TABS", "1")  # Có thể nhiều tab, phân tách dấu phẩy
 
 # --- Logging ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- Lấy biến môi trường ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))  # bắt buộc phải có, vd: -1001234567890
-GSHEETS_JSON = os.getenv("GSHEETS_JSON")
-GSHEET_NAME = os.getenv("GSHEET_NAME", "Sheet1")
+# --- Load dữ liệu từ Google Sheets ---
+def load_key_map_from_sheet():
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        # Tạo file tạm json key (bắt buộc vì gspread dùng file)
+        with open("temp_key.json", "w", encoding="utf-8") as f:
+            f.write(GOOGLE_SHEET_JSON)
 
-if not all([BOT_TOKEN, CHANNEL_ID, GSHEETS_JSON]):
-    raise ValueError("Bạn phải đặt BOT_TOKEN, CHANNEL_ID, GSHEETS_JSON trong biến môi trường.")
+        credentials = ServiceAccountCredentials.from_json_keyfile_name("temp_key.json", scope)
+        gc = gspread.authorize(credentials)
 
-# --- Khởi tạo Google Sheets API ---
-def get_sheets_service():
-    creds_json = json.loads(GSHEETS_JSON)
-    creds = Credentials.from_service_account_info(creds_json, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    service = build('sheets', 'v4', credentials=creds)
-    return service.spreadsheets()
+        sheet_file = gc.open(SHEET_NAME)
+        tabs = [tab.strip() for tab in SHEET_TABS.split(",")]
 
-sheets_api = get_sheets_service()
+        combined_df = pd.DataFrame()
+        for tab_name in tabs:
+            worksheet = sheet_file.worksheet(tab_name)
+            df = pd.DataFrame(worksheet.get_all_records())
+            if "key" not in df.columns or "name_file" not in df.columns or "message_id" not in df.columns:
+                logger.warning(f"Tab {tab_name} không có đủ cột ['key','name_file','message_id']")
+                continue
+            df["key"] = df["key"].astype(str).str.strip().str.lower()
+            combined_df = pd.concat([combined_df, df], ignore_index=True)
 
-# --- Hàm thêm dữ liệu vào Google Sheet ---
-def append_row_to_sheet(filename: str, message_id: int):
-    spreadsheet_id = sheets_api.spreadsheetId if hasattr(sheets_api, 'spreadsheetId') else None
-    # Bạn phải đặt ID spreadsheet của bạn (từ URL của Google Sheets) vào biến môi trường nếu muốn dùng nhiều sheet, 
-    # hoặc hardcode ở đây.
-    # Ví dụ: SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-    # Ở đây, giả sử biến môi trường chứa spreadsheet id luôn, bạn có thể thêm:
-    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-    if not SPREADSHEET_ID:
-        raise ValueError("Bạn phải đặt biến môi trường SPREADSHEET_ID chứa ID bảng tính Google Sheets.")
+        key_map = {
+            key: group[["name_file", "message_id"]].to_dict("records")
+            for key, group in combined_df.groupby("key")
+        }
+        logger.info(f"Loaded {len(key_map)} keys from Google Sheets")
+        return key_map
+    except Exception as e:
+        logger.error(f"Failed to load sheet: {e}")
+        return {}
 
-    body = {
-        "values": [[filename, message_id]]
-    }
-    result = sheets_api.values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=GSHEET_NAME,
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body=body
-    ).execute()
-    logging.info(f"Đã thêm dòng: {filename}, {message_id} vào Google Sheets (Response: {result.get('updates')})")
+KEY_MAP = load_key_map_from_sheet()
 
+# --- FastAPI app ---
+app = FastAPI()
 
-# --- Hàm xử lý tin nhắn ---
-async def handle_rar_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
+@app.on_event("startup")
+async def startup():
+    global bot_app
+    bot_app = Application.builder().token(BOT_TOKEN).build()
 
-    # Chỉ nhận tin nhắn từ channel đúng id
-    if update.effective_chat and update.effective_chat.id != CHANNEL_ID:
-        return
+    # Đăng ký handler
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_key))
 
-    if msg.document and msg.document.file_name.lower().endswith(".rar"):
-        filename = msg.document.file_name
-        message_id = msg.message_id
-        logging.info(f"Nhận file .rar: {filename}, message_id: {message_id}")
+    await bot_app.initialize()
+    logger.info("Bot initialized")
 
-        try:
-            append_row_to_sheet(filename, message_id)
-        except Exception as e:
-            logging.error(f"Lỗi khi ghi Google Sheets: {e}")
+@app.post("/webhook/{token}")
+async def telegram_webhook(token: str, request: Request):
+    if token != BOT_TOKEN:
+        logger.warning("Webhook called with invalid token")
+        raise HTTPException(status_code=403, detail="Invalid token")
 
+    try:
+        body = await request.json()
+        update = Update.de_json(body, bot_app.bot)
+        await bot_app.process_update(update)
+    except Exception as e:
+        logger.error(f"Webhook processing error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
-# --- Hàm chạy bot ---
-async def main():
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_rar_file))
-    logging.info("Bot đã chạy, chờ nhận file .rar từ channel...")
-    await application.run_polling()
+    return {"ok": True}
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# --- Bot Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("♥️ Please send your KEY to receive the file.")
+
+async def handle_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip().lower()
+    chat_id = update.effective_chat.id
+
+    if user_input in KEY_MAP:
+        files_info = KEY_MAP[user_input]
+        errors = 0
+
+        for file_info in files_info:
+            try:
+                await context.bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=CHANNEL_ID,
+                    message_id=int(file_info["message_id"]),
+                    protect_content=True
+                )
+                await update.message.reply_text(f"♥️ Your File \"{file_info['name_file']}\"")
+            except Exception as e:
+                logger.error(f"File send error: {e}")
+                errors += 1
+
+        if errors:
+            await update.message.reply_text(
+                "⚠️ Một số file bị lỗi khi gửi. Vui lòng liên hệ admin để được hỗ trợ.\n👉 https://t.me/A911Studio"
+            )
+    else:
+        await update.message.reply_text("❌ KEY is incorrect. Please check again.")
+
